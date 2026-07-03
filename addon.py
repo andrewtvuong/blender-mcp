@@ -290,7 +290,7 @@ class BlenderMCPServer:
         if (
             not self.auth_token
             or not isinstance(supplied, str)
-            or not hmac.compare_digest(supplied, self.auth_token)
+            or not hmac.compare_digest(supplied.encode("utf-8"), self.auth_token.encode("utf-8"))
         ):
             print("Rejected command with missing or invalid auth token")
             return {"status": "error", "message": "Unauthorized: missing or invalid auth token"}
