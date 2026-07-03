@@ -17,6 +17,8 @@ from bpy.props import IntProperty, BoolProperty
 import io
 from datetime import datetime
 import hashlib, hmac, base64
+import secrets
+from pathlib import Path
 import os.path as osp
 from contextlib import redirect_stdout, suppress
 
@@ -44,7 +46,8 @@ def get_blendermcp_addon_preferences(context=None):
     return addon.preferences if addon else None
 
 class BlenderMCPServer:
-    def __init__(self, host='localhost', port=9876):
+    def __init__(self, host='127.0.0.1', port=9876):
+        self.auth_token = None
         self.host = host
         self.port = port
         self.running = False
@@ -121,6 +124,25 @@ class BlenderMCPServer:
 
         self.running = True
 
+        # Generate a per-session shared secret and write it where the MCP
+        # server can read it. This prevents arbitrary localhost processes from
+        # sending commands to this socket.
+        try:
+            self.auth_token = secrets.token_hex(32)
+            token_dir = Path.home() / ".blender-mcp"
+            token_dir.mkdir(mode=0o700, exist_ok=True)
+            token_path = token_dir / "auth_token"
+            token_path.write_text(self.auth_token)
+            try:
+                os.chmod(token_dir, 0o700)
+                os.chmod(token_path, 0o600)
+            except OSError:
+                pass  # chmod semantics differ on Windows; dir is under the user profile
+        except Exception as e:
+            print(f"Failed to write auth token: {e}")
+            self.running = False
+            return
+
         try:
             # Create socket
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -140,6 +162,13 @@ class BlenderMCPServer:
 
     def stop(self):
         self.running = False
+        self.auth_token = None
+
+        # Remove the session auth token file
+        try:
+            (Path.home() / ".blender-mcp" / "auth_token").unlink()
+        except OSError:
+            pass
 
         # Close socket
         if self.socket:
@@ -255,6 +284,17 @@ class BlenderMCPServer:
 
     def execute_command(self, command):
         """Execute a command in the main Blender thread"""
+        # Require the per-session shared secret on every command. Constant-time
+        # comparison; reject before any dispatch (including status shortcuts).
+        supplied = command.get("auth")
+        if (
+            not self.auth_token
+            or not isinstance(supplied, str)
+            or not hmac.compare_digest(supplied.encode("utf-8"), self.auth_token.encode("utf-8"))
+        ):
+            print("Rejected command with missing or invalid auth token")
+            return {"status": "error", "message": "Unauthorized: missing or invalid auth token"}
+
         try:
             return self._execute_command_internal(command)
 
@@ -277,13 +317,26 @@ class BlenderMCPServer:
             "get_scene_info": self.get_scene_info,
             "get_object_info": self.get_object_info,
             "get_viewport_screenshot": self.get_viewport_screenshot,
-            "execute_code": self.execute_code,
-            "get_telemetry_consent": self.get_telemetry_consent,
             "get_polyhaven_status": self.get_polyhaven_status,
             "get_hyper3d_status": self.get_hyper3d_status,
             "get_sketchfab_status": self.get_sketchfab_status,
             "get_hunyuan3d_status": self.get_hunyuan3d_status,
         }
+
+        # Arbitrary code execution is opt-in. When disabled (the default),
+        # execute_code is not even registered as a handler. Note: enabling it
+        # gives the connected LLM full Python execution on this machine —
+        # exec() cannot be sandboxed in-process.
+        if getattr(bpy.context.scene, "blendermcp_allow_code_execution", False):
+            handlers["execute_code"] = self.execute_code
+        elif cmd_type == "execute_code":
+            return {
+                "status": "error",
+                "message": (
+                    "Code execution is disabled. Enable 'Allow arbitrary code "
+                    "execution' in the BlenderMCP panel (N-sidebar) to use this tool."
+                ),
+            }
 
         # Add Polyhaven handlers only if enabled
         if bpy.context.scene.blendermcp_use_polyhaven:
@@ -1178,21 +1231,6 @@ class BlenderMCPServer:
             print(f"Error in set_texture: {str(e)}")
             traceback.print_exc()
             return {"error": f"Failed to apply texture: {str(e)}"}
-
-    def get_telemetry_consent(self):
-        """Get the current telemetry consent status"""
-        try:
-            # Get addon preferences - use the module name
-            addon_prefs = bpy.context.preferences.addons.get(__name__)
-            if addon_prefs:
-                consent = addon_prefs.preferences.telemetry_consent
-            else:
-                # Fallback to default if preferences not available
-                consent = True
-        except (AttributeError, KeyError):
-            # Fallback to default if preferences not available
-            consent = True
-        return {"consent": consent}
 
     def get_polyhaven_status(self):
         """Get the current status of PolyHaven integration"""
@@ -2417,11 +2455,6 @@ class BlenderMCPServer:
 class BLENDERMCP_AddonPreferences(bpy.types.AddonPreferences):
     bl_idname = __name__
     
-    telemetry_consent: BoolProperty(
-        name="Allow Telemetry",
-        description="Allow collection of prompts, code snippets, and screenshots to help improve Blender MCP",
-        default=True
-    )
     hyper3d_api_key: bpy.props.StringProperty(
         name="Hyper3D API Key",
         subtype="PASSWORD",
@@ -2454,29 +2487,6 @@ class BLENDERMCP_AddonPreferences(bpy.types.AddonPreferences):
     def draw(self, context):
         layout = self.layout
         
-        # Telemetry section
-        layout.label(text="Telemetry & Privacy:", icon='PREFERENCES')
-        
-        box = layout.box()
-        row = box.row()
-        row.prop(self, "telemetry_consent", text="Allow Telemetry")
-        
-        # Info text
-        box.separator()
-        if self.telemetry_consent:
-            box.label(text="With consent: We collect anonymized prompts, code, and screenshots.", icon='INFO')
-        else:
-            box.label(text="Without consent: We only collect minimal anonymous usage data", icon='INFO')
-            box.label(text="(tool names, success/failure, duration - no prompts or code).", icon='BLANK1')
-        box.separator()
-        box.label(text="All data is fully anonymized. You can change this anytime.", icon='CHECKMARK')
-        
-        # Terms and Conditions link
-        box.separator()
-        row = box.row()
-        row.operator("blendermcp.open_terms", text="View Terms and Conditions", icon='TEXT')
-
-        layout.separator()
         layout.label(text="Persistent API Credentials:", icon='LOCKED')
         cred_box = layout.box()
         cred_box.prop(self, "sketchfab_api_key", text="Sketchfab API Key")
@@ -2499,6 +2509,12 @@ class BLENDERMCP_PT_Panel(bpy.types.Panel):
         prefs = get_blendermcp_addon_preferences(context)
 
         layout.prop(scene, "blendermcp_port")
+
+        code_box = layout.box()
+        code_box.prop(scene, "blendermcp_allow_code_execution", text="Allow arbitrary code execution")
+        if scene.blendermcp_allow_code_execution:
+            code_box.label(text="AI can run any Python on this machine", icon='ERROR')
+
         layout.prop(scene, "blendermcp_use_polyhaven", text="Use assets from Poly Haven")
 
         layout.prop(scene, "blendermcp_use_hyper3d", text="Use Hyper3D Rodin 3D model generation")
@@ -2600,24 +2616,6 @@ class BLENDERMCP_OT_StopServer(bpy.types.Operator):
 
         return {'FINISHED'}
 
-# Operator to open Terms and Conditions
-class BLENDERMCP_OT_OpenTerms(bpy.types.Operator):
-    bl_idname = "blendermcp.open_terms"
-    bl_label = "View Terms and Conditions"
-    bl_description = "Open the Terms and Conditions document"
-
-    def execute(self, context):
-        # Open the Terms and Conditions on GitHub
-        terms_url = "https://github.com/ahujasid/blender-mcp/blob/main/TERMS_AND_CONDITIONS.md"
-        try:
-            import webbrowser
-            webbrowser.open(terms_url)
-            self.report({'INFO'}, "Terms and Conditions opened in browser")
-        except Exception as e:
-            self.report({'ERROR'}, f"Could not open Terms and Conditions: {str(e)}")
-        
-        return {'FINISHED'}
-
 # Registration functions
 def register():
     bpy.types.Scene.blendermcp_port = IntProperty(
@@ -2637,6 +2635,12 @@ def register():
         name="Auto-Start Server",
         description="Automatically start the MCP server when Blender loads",
         default=True
+    )
+
+    bpy.types.Scene.blendermcp_allow_code_execution = bpy.props.BoolProperty(
+        name="Allow Arbitrary Code Execution",
+        description="DANGER: lets the connected AI run arbitrary Python on this machine (not just Blender API calls). Leave off unless you need it and review what runs",
+        default=False
     )
 
     bpy.types.Scene.blendermcp_use_polyhaven = bpy.props.BoolProperty(
@@ -2753,7 +2757,6 @@ def register():
     bpy.utils.register_class(BLENDERMCP_OT_SetFreeTrialHyper3DAPIKey)
     bpy.utils.register_class(BLENDERMCP_OT_StartServer)
     bpy.utils.register_class(BLENDERMCP_OT_StopServer)
-    bpy.utils.register_class(BLENDERMCP_OT_OpenTerms)
 
     # Auto-start the server so the MCP client can connect without manual UI interaction
     scene = getattr(bpy.context, 'scene', None)
@@ -2785,12 +2788,12 @@ def unregister():
     bpy.utils.unregister_class(BLENDERMCP_OT_SetFreeTrialHyper3DAPIKey)
     bpy.utils.unregister_class(BLENDERMCP_OT_StartServer)
     bpy.utils.unregister_class(BLENDERMCP_OT_StopServer)
-    bpy.utils.unregister_class(BLENDERMCP_OT_OpenTerms)
     bpy.utils.unregister_class(BLENDERMCP_AddonPreferences)
 
     del bpy.types.Scene.blendermcp_port
     del bpy.types.Scene.blendermcp_server_running
     del bpy.types.Scene.blendermcp_auto_start_server
+    del bpy.types.Scene.blendermcp_allow_code_execution
     del bpy.types.Scene.blendermcp_use_polyhaven
     del bpy.types.Scene.blendermcp_use_hyper3d
     del bpy.types.Scene.blendermcp_hyper3d_mode
